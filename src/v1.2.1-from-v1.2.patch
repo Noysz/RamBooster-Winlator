@@ -1,0 +1,292 @@
+--- rambooster_v1_2.cpp	2026-06-19 22:39:19.324634508 +0000
++++ rambooster_v1_2_1.cpp	2026-06-20 00:18:42.116622091 +0000
+@@ -1,6 +1,6 @@
+ // =============================================================================
+-//  RAMBOOSTER v1.2 - Winlator Edition
+-//  ModBy: Noysz | Base: RedRazorGothca
++//  RAMBOOSTER v1.2.1 - Winlator Edition
++//  ModBy: Noysz | Base: RedZeroGotcha (github.com/RedZeroGotcha/RamBoosterSingle)
+ //  Target: Helio G80-G99 | Compatible: Box64 & FEXCore
+ //
+ //  [FIX]    GDI Leak #1 & #2: hBg dan hBgClass dikelola eksplisit.
+@@ -34,6 +34,7 @@
+ 
+ #include <windows.h>
+ #include <stdio.h>
++#include <stdarg.h>     // v1.2.1: va_list buat setGuardStatusF
+ #include <process.h>
+ #include <mmsystem.h>
+ #include <commctrl.h>
+@@ -72,6 +73,18 @@
+ 
+ std::atomic<bool> isBoosting(false);
+ 
++// v1.2.1 [C1 FIX]: guardStatus diakses dari worker threads (boostThread,
++// zramGuardThread) + UI thread (WM_TIMER). Tanpa lock = data race UB.
++// Init di WM_CREATE, destroy di WM_DESTROY.
++CRITICAL_SECTION g_statusLock;
++
++// v1.2.1 [H1 FIX]: writeLog dipanggil concurrent dari beberapa thread.
++// Tanpa lock, rotation truncate + append bisa interleave & corrupt log.
++CRITICAL_SECTION g_logLock;
++
++// v1.2.1 [M3 FIX]: font handle disimpan global biar bisa cleanup di WM_DESTROY.
++HFONT hFont = NULL;
++
+ // hBg: brush untuk static controls (WM_CTLCOLORSTATIC)
+ // hBgClass: brush untuk background window class (WNDCLASSEX)
+ // Keduanya harus dihapus eksplisit di WM_DESTROY.
+@@ -79,6 +92,28 @@
+ HBRUSH hBgClass = NULL;
+ HWND hStatusLabel = NULL;
+ 
++// v1.2.1 [C1 FIX]: helper thread-safe untuk update/read guardStatus.
++// Pakai vsnprintf ke buffer lokal, lalu copy ke global di bawah lock.
++static void setGuardStatusF(const char* fmt, ...) {
++    char tmp[64];
++    va_list ap;
++    va_start(ap, fmt);
++    vsnprintf(tmp, sizeof(tmp), fmt, ap);
++    va_end(ap);
++    tmp[sizeof(tmp) - 1] = '\0';
++    EnterCriticalSection(&g_statusLock);
++    strncpy(guardStatus, tmp, sizeof(guardStatus) - 1);
++    guardStatus[sizeof(guardStatus) - 1] = '\0';
++    LeaveCriticalSection(&g_statusLock);
++}
++
++static void getGuardStatus(char* out, size_t outsize) {
++    EnterCriticalSection(&g_statusLock);
++    strncpy(out, guardStatus, outsize - 1);
++    out[outsize - 1] = '\0';
++    LeaveCriticalSection(&g_statusLock);
++}
++
+ 
+ // =============================================================================
+ //  LOGGING
+@@ -89,6 +124,10 @@
+     if (strlen(exeFolder) == 0) return;
+     snprintf(logPath, sizeof(logPath), "%s\\DEBUG_LOG.txt", exeFolder);
+ 
++    // v1.2.1 [H1 FIX]: serialize seluruh rotation + append agar dua thread
++    // ga interleave truncate/append.
++    EnterCriticalSection(&g_logLock);
++
+     // Log Rotation: jika file log sudah lebih dari 1MB, timpa isinya
+     // dari awal (truncate). Mode "w" otomatis mengosongkan file tanpa
+     // perlu delete atau rename — lebih simpel dan tidak meninggalkan
+@@ -117,6 +156,8 @@
+             level, message);
+         fclose(f);
+     }
++
++    LeaveCriticalSection(&g_logLock);
+ }
+ 
+ 
+@@ -233,6 +274,21 @@
+     isDWYOR         = GetPrivateProfileInt("SETTINGS", "DWYOR_MODE",         0,  ini);
+     emulatorMode    = GetPrivateProfileInt("SETTINGS", "EMULATOR_MODE",      0,  ini);
+ 
++    // v1.2.1: range clamp untuk cegah DoS-self & invalid threshold.
++    // INTERVAL_MENIT=0 → spam boost tiap WM_TIMER tick.
++    // Threshold di luar 0..100 → guard misfire (selalu trigger atau silent skip).
++    if (intervalMenit < 1)  { intervalMenit = 1;  writeLog("WARNING", "INTERVAL_MENIT < 1, di-clamp 1."); }
++    if (intervalMenit > 60) { intervalMenit = 60; writeLog("WARNING", "INTERVAL_MENIT > 60, di-clamp 60."); }
++    if (thresholdCrisis < 50 || thresholdCrisis > 100) {
++        thresholdCrisis = 90; writeLog("WARNING", "THRESHOLD_CRISIS invalid, reset 90.");
++    }
++    if (preCrisisLevel < 0 || preCrisisLevel > 100) {
++        preCrisisLevel = 83; writeLog("WARNING", "PRE_CRISIS_LEVEL invalid, reset 83.");
++    }
++    if (zramGuardLevel < 50 || zramGuardLevel > 95) {
++        zramGuardLevel = 75; writeLog("WARNING", "ZRAM_GUARD_LEVEL invalid, reset 75.");
++    }
++
+     // Baca CORE_AFFINITY_MASK sebagai string hex lalu convert ke DWORD.
+     // Nilai 0x00 = sengaja skip Core Pinning (contoh: SD 8 Elite / Oryon).
+     // Nilai 0 dari parsing gagal dibedakan dengan cek string aslinya.
+@@ -301,6 +357,21 @@
+     // selama target > 0, alokasi jalan. Porsi tiap lapisan diatur di pemanggil.
+     if (target > 0.0) {
+         SIZE_T totalToAlloc = (SIZE_T)((double)ms.ullTotalPhys * (target / 100.0));
++
++        // v1.2.1 [H3 FIX]: cap absolute 1.5GB.
++        // CRISIS 45% di HP 8GB = 3.6GB → wall-clock ~13 detik saat game paling
++        // butuh resource. 1.5GB cukup buat pressure LMK di mayoritas HP +
++        // wall-clock ~4-5 detik. Lebih responsif.
++        SIZE_T absoluteCap = (SIZE_T)1536 * 1024 * 1024; // 1.5 GiB
++        if (totalToAlloc > absoluteCap) {
++            char capMsg[96];
++            snprintf(capMsg, sizeof(capMsg),
++                "Target %.0f%% (%.0f MB) di-cap ke 1536 MB.",
++                target, (double)totalToAlloc / 1048576.0);
++            writeLog("INFO", capMsg);
++            totalToAlloc = absoluteCap;
++        }
++
+         SIZE_T bSize = 8 * 1024 * 1024; // 8MB per chunk
+ 
+         // B2: hitung jumlah slot dari kebutuhan nyata, bukan angka ajaib 6000.
+@@ -474,8 +545,7 @@
+     // (lastBoostTick TIDAK di-set di sini — sudah di-set di titik keputusan
+     //  saat spawn, sesuai B5.)
+     if (ms.ullAvailPhys <= safetyFloor) {
+-        snprintf(guardStatus, sizeof(guardStatus),
+-            "ZRAM Guard | skip (RAM %d%%, low)", currentUsage);
++        setGuardStatusF("ZRAM Guard | skip (RAM %d%%, low)", currentUsage);
+         writeLog("GUARD", "ZRAM Guard dilewati — RAM sudah di bawah safety floor.");
+         isBoosting = false;
+         return;
+@@ -511,11 +581,9 @@
+         snprintf(z, sizeof(z),
+             "ZRAM Guard (RAM: %d%%) | Cleaned: %.0f MB", currentUsage, gain);
+         writeLog("GUARD", z);
+-        snprintf(guardStatus, sizeof(guardStatus),
+-            "ZRAM Guard | +%.0f MB", gain);
++        setGuardStatusF("ZRAM Guard | +%.0f MB", gain);
+     } else {
+-        snprintf(guardStatus, sizeof(guardStatus),
+-            "ZRAM Guard | RAM %d%%", currentUsage);
++        setGuardStatusF("ZRAM Guard | RAM %d%%", currentUsage);
+     }
+ 
+     isBoosting = false; // lastBoostTick sudah di-set saat spawn (B5)
+@@ -563,7 +631,7 @@
+             // sebelum mencoba lagi agar tidak spam sia-sia
+             crisisBackoff = now + 120000;
+             crisisStreak  = 0;
+-            snprintf(guardStatus, sizeof(guardStatus), "Crisis: Backoff 2 menit");
++            setGuardStatusF("Crisis: Backoff 2 menit");
+             writeLog("CRITICAL", "CRISIS 2x berturut-turut. Backoff 2 menit.");
+             isBoosting = false;
+             return;
+@@ -574,7 +642,7 @@
+             "CRISIS ALERT! RAM %d%% >= threshold %d%%. Boost barbar 45%%! (streak: %d)",
+             currentUsage, thresholdCrisis, crisisStreak);
+         writeLog("CRITICAL", cLog);
+-        snprintf(guardStatus, sizeof(guardStatus), "CRISIS! RAM %d%%", currentUsage);
++        setGuardStatusF("CRISIS! RAM %d%%", currentUsage);
+         lastBoostTick = now; // B5: set di titik keputusan, bukan di akhir thread
+         spawnBoost(45.0);    // reset isBoosting sendiri kalau gagal
+         return;
+@@ -583,8 +651,7 @@
+     // Jika sedang dalam backoff, tampilkan status dan skip
+     if (now <= crisisBackoff) {
+         DWORD sisaDetik = (crisisBackoff - now) / 1000;
+-        snprintf(guardStatus, sizeof(guardStatus),
+-            "Crisis Backoff: %ds", (int)sisaDetik);
++        setGuardStatusF("Crisis Backoff: %ds", (int)sisaDetik);
+         isBoosting = false;
+         return;
+     }
+@@ -618,8 +685,7 @@
+             "Pre-Crisis! RAM %d%% >= %d%%. Boost preventif 20%%.",
+             currentUsage, preCrisisLevel);
+         writeLog("PRE-CRISIS", pcLog);
+-        snprintf(guardStatus, sizeof(guardStatus),
+-            "Pre-Crisis | RAM %d%%", currentUsage);
++        setGuardStatusF("Pre-Crisis | RAM %d%%", currentUsage);
+         spawnBoost(20.0);
+         return;
+     }
+@@ -644,8 +710,7 @@
+             "Cleaning cycle (RAM: %d%%, porsi: %d%%, interval: %ds).",
+             currentUsage, routineCleanPercent, (int)(effectiveInterval / 1000));
+         writeLog("ROUTINE", rLog);
+-        snprintf(guardStatus, sizeof(guardStatus),
+-            "Routine Clean %d%% | RAM %d%%", routineCleanPercent, currentUsage);
++        setGuardStatusF("Routine Clean %d%% | RAM %d%%", routineCleanPercent, currentUsage);
+         spawnBoost((double)routineCleanPercent);
+         return;
+     }
+@@ -671,7 +736,7 @@
+     }
+ 
+     // Idle — tidak ada guard yang terpicu.
+-    snprintf(guardStatus, sizeof(guardStatus), "Idle | RAM %d%%", currentUsage);
++    setGuardStatusF("Idle | RAM %d%%", currentUsage);
+     isBoosting = false;
+ }
+ 
+@@ -684,6 +749,12 @@
+     switch (msg) {
+ 
+         case WM_CREATE: {
++            // v1.2.1: init CRITICAL_SECTIONs SEBELUM apapun yg bisa nge-log
++            // atau update guardStatus. getExeFolder & InitSettings di bawah
++            // memanggil writeLog → wajib g_logLock siap.
++            InitializeCriticalSection(&g_statusLock);
++            InitializeCriticalSection(&g_logLock);
++
+             hBg = CreateSolidBrush(MY_COLOR_BG);
+ 
+             getExeFolder();
+@@ -693,18 +764,19 @@
+                 : "Mode: Box64 (Winlator) — floor 12%, sleep 25ms");
+             lastRoutineTick = GetTickCount();
+ 
+-            HFONT hF = CreateFont(18, 0, 0, 0, FW_NORMAL, 0, 0, 0,
++            // v1.2.1 [M3 FIX]: simpan ke global agar bisa DeleteObject di WM_DESTROY.
++            hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, 0, 0, 0,
+                 1, 0, 0, 3, 2, "Segoe UI");
+ 
+             HWND hTitle = CreateWindow("STATIC", "RAMBOOSTER v1.2 Winlator",
+                 WS_VISIBLE | WS_CHILD | SS_CENTER,
+                 20, 15, 340, 30, hwnd, NULL, NULL, NULL);
+-            SendMessage(hTitle, WM_SETFONT, (WPARAM)hF, TRUE);
++            SendMessage(hTitle, WM_SETFONT, (WPARAM)hFont, TRUE);
+ 
+             hStatusLabel = CreateWindow("STATIC", "Ready to Guard...",
+                 WS_VISIBLE | WS_CHILD | SS_CENTER,
+                 20, 50, 340, 20, hwnd, NULL, NULL, NULL);
+-            SendMessage(hStatusLabel, WM_SETFONT, (WPARAM)hF, TRUE);
++            SendMessage(hStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
+ 
+             CreateWindow("BUTTON", "SELECT GAME",
+                 WS_VISIBLE | WS_CHILD,
+@@ -717,7 +789,7 @@
+             HWND hWatermark = CreateWindow("STATIC", "ModBy: Noysz",
+                 WS_VISIBLE | WS_CHILD | SS_CENTER,
+                 20, 210, 340, 20, hwnd, NULL, NULL, NULL);
+-            SendMessage(hWatermark, WM_SETFONT, (WPARAM)hF, TRUE);
++            SendMessage(hWatermark, WM_SETFONT, (WPARAM)hFont, TRUE);
+ 
+             if (!SetTimer(hwnd, TIMER_MAIN, 2000, NULL)) {
+                 writeLog("CRITICAL", "Gagal membuat Timer. Silent Guard lumpuh.");
+@@ -825,11 +897,14 @@
+             MEMORYSTATUSEX ms;
+             ms.dwLength = sizeof(ms);
+             if (GlobalMemoryStatusEx(&ms)) {
+-                char buf[128];
++                // v1.2.1 [C1 FIX]: baca guardStatus via lock.
++                char statusCopy[64];
++                getGuardStatus(statusCopy, sizeof(statusCopy));
++                char buf[160];
+                 snprintf(buf, sizeof(buf), "RAM: %d%% | Free: %.0f MB | %s",
+                     (int)ms.dwMemoryLoad,
+                     (double)ms.ullAvailPhys / 1048576.0,
+-                    guardStatus);
++                    statusCopy);
+                 SetWindowText(hStatusLabel, buf);
+             }
+             RunSilentGuard(hwnd);
+@@ -847,6 +922,17 @@
+             if (hBg)      { DeleteObject(hBg);      hBg      = NULL; }
+             if (hBgClass) { DeleteObject(hBgClass);  hBgClass = NULL; }
+ 
++            // v1.2.1 [M3 FIX]: cleanup font.
++            if (hFont)    { DeleteObject(hFont);    hFont    = NULL; }
++
++            // v1.2.1 [C1+H1 FIX]: cleanup CRITICAL_SECTIONs.
++            // NOTE: worker threads mungkin masih hidup. Process exit (lewat
++            // PostQuitMessage → WinMain return) akan terminate paksa via ExitProcess.
++            // CS yg ke-delete saat thread masih hold = UB tapi proses udah mau mati,
++            // OS cleanup. Acceptable.
++            DeleteCriticalSection(&g_statusLock);
++            DeleteCriticalSection(&g_logLock);
++
+             PostQuitMessage(0);
+             break;
+     }
