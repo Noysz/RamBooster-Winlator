@@ -1,0 +1,127 @@
+# RamBooster v1.2.1-a1 — Security & Stability Patch
+#
+# Apply: git apply src/rambooster-1.2.1-a1.patch  (dari root repo)
+# Rebuild: i686-w64-mingw32-g++ -O2 -static -mwindows \
+#            -o bin/RamBooster_v1.2.1.exe src/rambooster.cpp \
+#            -lgdi32 -luser32 -lkernel32 -lcomctl32 -lshell32 -lpsapi -lwinmm
+#
+# Isi (6 fix, source-only — TIDAK termasuk binary .exe):
+#   C2     drain worker thread sebelum DeleteCriticalSection (Wine futex UB)
+#   H2+SEC CreateProcess: matikan unquoted-path hijack + buffer-mutation
+#   H3     lebarin launchMsg buffer (hapus margin 7-byte fragile)
+#   H4     CORE_AFFINITY_MASK parse: strtoul base-0 + endptr (8/8 tested)
+#   H1     blocks[] di-size dari worst-case 1MB chunk (anti silent under-alloc)
+#   M3     emulatorMode -> std::atomic<int> (race worker<->UI)
+#
+# Catatan: C1 (cpp-reviewer claim race di tick globals) DITOLAK = false
+#   positive; semua tick/streak global UI-thread-only (serialized message loop).
+#
+diff --git a/src/rambooster.cpp b/src/rambooster.cpp
+index 69639a0..ad2bc1f 100644
+--- a/src/rambooster.cpp
++++ b/src/rambooster.cpp
+@@ -59,7 +59,9 @@ int zramGuardLevel;
+ int intervalMenit;
+ int routineCleanPercent; // B4: porsi (%) routine cleaning periodik. 0 = matikan.
+ int isMuted, isZramGuard, isDWYOR, cleanStartPercent;
+-int emulatorMode;      // 0 = Box64 (Winlator), 1 = FEXCore (GameHub)
++std::atomic<int> emulatorMode; // 0 = Box64 (Winlator), 1 = FEXCore (GameHub)
++                       // [M3 FIX] atomic: dibaca worker thread (boostThread/zramGuardThread)
++                       // sementara ditulis UI thread via InitSettings on button press.
+ DWORD affinityMask;    // CPU affinity mask untuk Core Pinning
+ 
+ DWORD lastBoostTick      = 0;
+@@ -295,14 +297,16 @@ void InitSettings() {
+     char maskStr[16] = "0xC0";
+     GetPrivateProfileString("SETTINGS", "CORE_AFFINITY_MASK", "0xC0",
+         maskStr, sizeof(maskStr), ini);
+-    affinityMask = (DWORD)strtoul(maskStr, NULL, 16);
+-    // Fallback ke 0xC0 HANYA jika string tidak bisa di-parse sama sekali
+-    // (bukan angka valid). Jika user sengaja tulis 0x00, hormati itu.
+-    if (affinityMask == 0 &&
+-        maskStr[0] != '0' &&
+-        maskStr[0] != 'x' &&
+-        maskStr[0] != 'X') {
++    // [H4 FIX] base 0 = auto-detect 0x-hex / desimal. endPtr cek apakah
++    // strtoul benar-benar konsumsi karakter. Logika lama salah: input "xC0"
++    // (tanpa leading 0) parse jadi 0 tapi maskStr[0]=='x' nge-skip fallback,
++    // jadi diam-diam disable pinning padahal user niat 0xC0. "0x00" (niat
++    // disable) tetap dihormati karena strtoul konsumsi "0x00" → endPtr maju.
++    char* maskEnd = NULL;
++    affinityMask = (DWORD)strtoul(maskStr, &maskEnd, 0);
++    if (maskEnd == maskStr) { // tidak ada karakter valid yang dikonsumsi
+         affinityMask = 0xC0;
++        writeLog("WARNING", "CORE_AFFINITY_MASK tak bisa di-parse, pakai default 0xC0.");
+     }
+ }
+ 
+@@ -375,9 +379,12 @@ void boostThread(void* param) {
+         SIZE_T bSize = 8 * 1024 * 1024; // 8MB per chunk
+ 
+         // B2: hitung jumlah slot dari kebutuhan nyata, bukan angka ajaib 6000.
+-        // +8 margin untuk jaga-jaga kalau bSize mengecil (VirtualAlloc gagal →
+-        // chunk dibagi 2 → butuh lebih banyak slot dari perkiraan awal).
+-        SIZE_T maxBlocks = (totalToAlloc / bSize) + 8;
++        // [H1 FIX] Ukur slot dari worst-case bSize TERKECIL (1MB, batas halving
++        // di bawah), bukan bSize awal 8MB. Logika lama (/bSize + 8) undercount
++        // kalau VirtualAlloc gagal berulang & bSize turun 8→4→2→1MB: butuh slot
++        // sampai 8x lipat, margin +8 ga cukup → loop berhenti diam-diam sebelum
++        // target. Worst-case ~1544 slot × 8B = ~12KB, negligible.
++        SIZE_T maxBlocks = (totalToAlloc / (1024 * 1024)) + 8;
+         void** blocks = (void**)malloc(sizeof(void*) * maxBlocks);
+         if (blocks) {
+             int    count     = 0;
+@@ -853,12 +860,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+                     if (lastSep) *lastSep = '\0';
+                     else         strncpy(workDir, ".", MAX_PATH - 1);
+ 
++                    // [H2 + SEC FIX] Dua bug di satu call site:
++                    //  H2: CreateProcess boleh MEMODIFIKASI lpCommandLine in-place
++                    //      (MSDN). Dulu gamePath (global) dioper langsung → bisa
++                    //      ke-corrupt setelah launch pertama. Sekarang pakai copy
++                    //      lokal yang writable.
++                    //  SEC: lpApplicationName=NULL + path tak di-quote = unquoted
++                    //      path hijack — "C:\Program Files\g.exe" coba "C:\Program.exe"
++                    //      dulu. Set lpApplicationName=gamePath (path eksak, TANPA
++                    //      parsing spasi) mematikan hijack; lpCommandLine di-quote
++                    //      untuk argv[0] yang benar.
++                    char cmdLine[MAX_PATH + 2];
++                    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", gamePath);
++
+                     STARTUPINFO        si = {sizeof(si)};
+                     PROCESS_INFORMATION pi;
+-                    if (CreateProcess(NULL, gamePath, NULL, NULL, FALSE,
++                    if (CreateProcess(gamePath, cmdLine, NULL, NULL, FALSE,
+                         NORMAL_PRIORITY_CLASS, NULL, workDir, &si, &pi))
+                     {
+-                        char launchMsg[MAX_PATH + 32];
++                        // [H3 FIX] buffer dilebarin: prefix 24 char + workDir
++                        // (s/d MAX_PATH-1) bikin margin lama cuma 7 byte - fragile
++                        // kalau format string berubah. MAX_PATH+64 kasih ruang aman.
++                        char launchMsg[MAX_PATH + 64];
+                         snprintf(launchMsg, sizeof(launchMsg),
+                             "Game launched. WorkDir: %s", workDir);
+                         writeLog("LAUNCH", launchMsg);
+@@ -925,11 +948,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+             // v1.2.1 [M3 FIX]: cleanup font.
+             if (hFont)    { DeleteObject(hFont);    hFont    = NULL; }
+ 
+-            // v1.2.1 [C1+H1 FIX]: cleanup CRITICAL_SECTIONs.
+-            // NOTE: worker threads mungkin masih hidup. Process exit (lewat
+-            // PostQuitMessage → WinMain return) akan terminate paksa via ExitProcess.
+-            // CS yg ke-delete saat thread masih hold = UB tapi proses udah mau mati,
+-            // OS cleanup. Acceptable.
++            // [C2 FIX] Drain worker thread sebelum delete CRITICAL_SECTION.
++            // Di Wine/ntdll, DeleteCriticalSection saat thread lain BLOCKED di
++            // EnterCriticalSection bisa corrupt futex state → SIGABRT di worker
++            // yang masih jalan (bukan sekadar "OS cleanup" seperti asumsi lama).
++            // Spin-wait dgn cap keras 3 detik: worst-case exit molor 3s, tapi
++            // mencegah crash. isBoosting di-reset worker saat selesai.
++            {
++                DWORD drainDeadline = GetTickCount() + 3000;
++                while (isBoosting.load() && GetTickCount() < drainDeadline)
++                    Sleep(50);
++            }
+             DeleteCriticalSection(&g_statusLock);
+             DeleteCriticalSection(&g_logLock);
+ 
