@@ -377,9 +377,12 @@ void boostThread(void* param) {
         SIZE_T bSize = 8 * 1024 * 1024; // 8MB per chunk
 
         // B2: hitung jumlah slot dari kebutuhan nyata, bukan angka ajaib 6000.
-        // +8 margin untuk jaga-jaga kalau bSize mengecil (VirtualAlloc gagal →
-        // chunk dibagi 2 → butuh lebih banyak slot dari perkiraan awal).
-        SIZE_T maxBlocks = (totalToAlloc / bSize) + 8;
+        // [H1 FIX] Ukur slot dari worst-case bSize TERKECIL (1MB, batas halving
+        // di bawah), bukan bSize awal 8MB. Logika lama (/bSize + 8) undercount
+        // kalau VirtualAlloc gagal berulang & bSize turun 8→4→2→1MB: butuh slot
+        // sampai 8x lipat, margin +8 ga cukup → loop berhenti diam-diam sebelum
+        // target. Worst-case ~1544 slot × 8B = ~12KB, negligible.
+        SIZE_T maxBlocks = (totalToAlloc / (1024 * 1024)) + 8;
         void** blocks = (void**)malloc(sizeof(void*) * maxBlocks);
         if (blocks) {
             int    count     = 0;
