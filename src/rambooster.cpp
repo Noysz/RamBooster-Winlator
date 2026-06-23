@@ -925,11 +925,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // v1.2.1 [M3 FIX]: cleanup font.
             if (hFont)    { DeleteObject(hFont);    hFont    = NULL; }
 
-            // v1.2.1 [C1+H1 FIX]: cleanup CRITICAL_SECTIONs.
-            // NOTE: worker threads mungkin masih hidup. Process exit (lewat
-            // PostQuitMessage → WinMain return) akan terminate paksa via ExitProcess.
-            // CS yg ke-delete saat thread masih hold = UB tapi proses udah mau mati,
-            // OS cleanup. Acceptable.
+            // [C2 FIX] Drain worker thread sebelum delete CRITICAL_SECTION.
+            // Di Wine/ntdll, DeleteCriticalSection saat thread lain BLOCKED di
+            // EnterCriticalSection bisa corrupt futex state → SIGABRT di worker
+            // yang masih jalan (bukan sekadar "OS cleanup" seperti asumsi lama).
+            // Spin-wait dgn cap keras 3 detik: worst-case exit molor 3s, tapi
+            // mencegah crash. isBoosting di-reset worker saat selesai.
+            {
+                DWORD drainDeadline = GetTickCount() + 3000;
+                while (isBoosting.load() && GetTickCount() < drainDeadline)
+                    Sleep(50);
+            }
             DeleteCriticalSection(&g_statusLock);
             DeleteCriticalSection(&g_logLock);
 
