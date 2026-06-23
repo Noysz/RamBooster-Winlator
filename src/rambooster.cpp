@@ -853,9 +853,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (lastSep) *lastSep = '\0';
                     else         strncpy(workDir, ".", MAX_PATH - 1);
 
+                    // [H2 + SEC FIX] Dua bug di satu call site:
+                    //  H2: CreateProcess boleh MEMODIFIKASI lpCommandLine in-place
+                    //      (MSDN). Dulu gamePath (global) dioper langsung → bisa
+                    //      ke-corrupt setelah launch pertama. Sekarang pakai copy
+                    //      lokal yang writable.
+                    //  SEC: lpApplicationName=NULL + path tak di-quote = unquoted
+                    //      path hijack — "C:\Program Files\g.exe" coba "C:\Program.exe"
+                    //      dulu. Set lpApplicationName=gamePath (path eksak, TANPA
+                    //      parsing spasi) mematikan hijack; lpCommandLine di-quote
+                    //      untuk argv[0] yang benar.
+                    char cmdLine[MAX_PATH + 2];
+                    snprintf(cmdLine, sizeof(cmdLine), "\"%s\"", gamePath);
+
                     STARTUPINFO        si = {sizeof(si)};
                     PROCESS_INFORMATION pi;
-                    if (CreateProcess(NULL, gamePath, NULL, NULL, FALSE,
+                    if (CreateProcess(gamePath, cmdLine, NULL, NULL, FALSE,
                         NORMAL_PRIORITY_CLASS, NULL, workDir, &si, &pi))
                     {
                         char launchMsg[MAX_PATH + 32];
