@@ -295,14 +295,16 @@ void InitSettings() {
     char maskStr[16] = "0xC0";
     GetPrivateProfileString("SETTINGS", "CORE_AFFINITY_MASK", "0xC0",
         maskStr, sizeof(maskStr), ini);
-    affinityMask = (DWORD)strtoul(maskStr, NULL, 16);
-    // Fallback ke 0xC0 HANYA jika string tidak bisa di-parse sama sekali
-    // (bukan angka valid). Jika user sengaja tulis 0x00, hormati itu.
-    if (affinityMask == 0 &&
-        maskStr[0] != '0' &&
-        maskStr[0] != 'x' &&
-        maskStr[0] != 'X') {
+    // [H4 FIX] base 0 = auto-detect 0x-hex / desimal. endPtr cek apakah
+    // strtoul benar-benar konsumsi karakter. Logika lama salah: input "xC0"
+    // (tanpa leading 0) parse jadi 0 tapi maskStr[0]=='x' nge-skip fallback,
+    // jadi diam-diam disable pinning padahal user niat 0xC0. "0x00" (niat
+    // disable) tetap dihormati karena strtoul konsumsi "0x00" → endPtr maju.
+    char* maskEnd = NULL;
+    affinityMask = (DWORD)strtoul(maskStr, &maskEnd, 0);
+    if (maskEnd == maskStr) { // tidak ada karakter valid yang dikonsumsi
         affinityMask = 0xC0;
+        writeLog("WARNING", "CORE_AFFINITY_MASK tak bisa di-parse, pakai default 0xC0.");
     }
 }
 
