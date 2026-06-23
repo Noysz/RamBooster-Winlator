@@ -871,7 +871,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (CreateProcess(gamePath, cmdLine, NULL, NULL, FALSE,
                         NORMAL_PRIORITY_CLASS, NULL, workDir, &si, &pi))
                     {
-                        char launchMsg[MAX_PATH + 32];
+                        // [H3 FIX] buffer dilebarin: prefix 24 char + workDir
+                        // (s/d MAX_PATH-1) bikin margin lama cuma 7 byte - fragile
+                        // kalau format string berubah. MAX_PATH+64 kasih ruang aman.
+                        char launchMsg[MAX_PATH + 64];
                         snprintf(launchMsg, sizeof(launchMsg),
                             "Game launched. WorkDir: %s", workDir);
                         writeLog("LAUNCH", launchMsg);
