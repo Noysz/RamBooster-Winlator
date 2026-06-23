@@ -59,7 +59,9 @@ int zramGuardLevel;
 int intervalMenit;
 int routineCleanPercent; // B4: porsi (%) routine cleaning periodik. 0 = matikan.
 int isMuted, isZramGuard, isDWYOR, cleanStartPercent;
-int emulatorMode;      // 0 = Box64 (Winlator), 1 = FEXCore (GameHub)
+std::atomic<int> emulatorMode; // 0 = Box64 (Winlator), 1 = FEXCore (GameHub)
+                       // [M3 FIX] atomic: dibaca worker thread (boostThread/zramGuardThread)
+                       // sementara ditulis UI thread via InitSettings on button press.
 DWORD affinityMask;    // CPU affinity mask untuk Core Pinning
 
 DWORD lastBoostTick      = 0;
